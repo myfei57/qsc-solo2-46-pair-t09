@@ -52,12 +52,42 @@ class DispatchFlowTests(unittest.TestCase):
         status, payload = dispatch(self.console, "POST", "/api/slew/start")
         self.assertEqual(status, 409)
         self.assertEqual(payload["error"], "zone latch held")
+        # 间距仍不足，清除后两车继续保持闩锁并说明差距
+        status, payload = dispatch(self.console, "POST", "/api/zone/clear")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["data"]["latch"])
+        held = payload["data"]["held_cranes"]
+        self.assertEqual([entry["crane_id"] for entry in held], ["crane-1", "crane-2"])
+        self.assertTrue(any("crane-2" in reason for reason in held[0]["missing"]))
+        status, payload = dispatch(self.console, "POST", "/api/slew/start")
+        self.assertEqual(status, 409)
+        # 拉开间距后按车释放，闩锁才解除
+        dispatch(self.console, "POST", "/api/cluster/survey", {"cranes": {"crane-2": {"x": 80, "y": 0}}})
         status, payload = dispatch(self.console, "POST", "/api/zone/clear")
         self.assertEqual(status, 200)
         self.assertFalse(payload["data"]["latch"])
+        releases = payload["data"]["pending_releases"]
+        self.assertEqual([entry["crane_id"] for entry in releases], ["crane-1", "crane-2"])
+        self.assertEqual([entry["seq"] for entry in releases], [1, 2])
         status, payload = dispatch(self.console, "POST", "/api/slew/start")
         self.assertEqual(status, 200)
         self.assertTrue(payload["data"]["moving"])
+
+    def test_zone_clear_releases_vacated_crane(self) -> None:
+        dispatch(self.console, "POST", "/api/cluster/survey", {"cranes": {"crane-2": {"x": 5, "y": 0}}})
+        dispatch(self.console, "POST", "/api/zone/occupy", {"crane_id": "crane-1"})
+        dispatch(self.console, "POST", "/api/zone/occupy", {"crane_id": "crane-2"})
+        dispatch(self.console, "POST", "/api/zone/vacate", {"crane_id": "crane-2"})
+        status, payload = dispatch(self.console, "POST", "/api/zone/clear")
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["data"]["latch"])
+        releases = payload["data"]["pending_releases"]
+        basis = {entry["crane_id"]: entry["basis"] for entry in releases}
+        self.assertEqual(basis["crane-2"], "占用已退出分区")
+        request = Request("GET", "/api/audit", {"action": ["zone-release"]}, {})
+        status, payload = self.console.dispatch(request)
+        self.assertEqual(status, 200)
+        self.assertTrue(any(entry["crane_id"] == "crane-2" for entry in payload["data"]))
 
     def test_occupy_requires_crane_id(self) -> None:
         status, _ = dispatch(self.console, "POST", "/api/zone/occupy", {})

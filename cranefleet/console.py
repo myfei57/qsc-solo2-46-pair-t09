@@ -214,15 +214,30 @@ class Console:
         return 200, ok(zone_module.occupants_snapshot(self.zone))
 
     def handle_zone_clear(self, request: Request) -> tuple[int, dict[str, Any]]:
-        generation = zone_module.clear_conflict(self.zone, self.cluster)
+        outcome = zone_module.clear_conflict(
+            self.zone,
+            self.cluster,
+            positions=fleet.current_positions(self.cluster),
+            safe=self.config.safe_separation,
+        )
+        released = set(outcome.released)
         for crane_id in self.cranes:
-            if fleet.is_released(self.cluster, crane_id):
+            if crane_id in released:
                 slew_module.release_latch_hold(self.slew)
         try:
             zone_module.persist(self.zone, self.store)
         except StoreError as exc:
             LOGGER.debug("best-effort zone persist skipped after clear: %s", exc)
-        self.audit.record("system", "zone-clear", f"{self.zone.id} generation={generation}")
+        for entry in outcome.releases:
+            self.audit.record(entry.crane_id, "zone-release", f"seq={entry.seq} {entry.basis}")
+        for held in outcome.held:
+            self.audit.record(held.crane_id, "zone-hold", "；".join(held.missing))
+        self.audit.record(
+            "system",
+            "zone-clear",
+            f"{self.zone.id} generation={outcome.generation} "
+            f"released={len(outcome.releases)} held={len(outcome.held)}",
+        )
         return 200, ok(views.zone_view(self))
 
     # ---------------------------------------------------------------- cluster

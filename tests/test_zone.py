@@ -13,6 +13,7 @@ from cranefleet.zone import (
     clear_conflict,
     coverage_check,
     detect_conflicts,
+    held_snapshot,
     is_latched,
     latch_generation,
     latest_registration_seq,
@@ -25,6 +26,7 @@ from cranefleet.zone import (
     register_conflict,
     registration_count,
     registration_seq_of,
+    release_seq_now,
     restore,
     separation,
     vacate,
@@ -102,18 +104,116 @@ class ZoneOccupancyTests(unittest.TestCase):
         lock_zone(self.zone)
         self.assertEqual(latch_generation(self.zone), 1)
         notifier = RecordingNotifier()
-        generation = clear_conflict(self.zone, notifier)
-        self.assertEqual(generation, 2)
+        outcome = clear_conflict(
+            self.zone,
+            notifier,
+            positions={"crane-1": Point(0.0, 0.0), "crane-2": Point(80.0, 0.0)},
+            safe=12.0,
+        )
+        self.assertEqual(outcome.generation, 2)
+        self.assertEqual(outcome.released, ("crane-1", "crane-2"))
+        self.assertEqual(outcome.held, ())
         self.assertFalse(self.zone.is_conflict())
         self.assertFalse(is_latched(self.zone))
         self.assertEqual(notifier.calls[0][0], "zone-1")
+        self.assertEqual(notifier.calls[0][1], ("crane-1", "crane-2"))
         self.assertEqual(notifier.calls[0][2], 2)
         self.assertEqual(notifier.calls[0][3], ("crane-1", "crane-2"))
-        self.assertEqual(len(pending_releases(self.zone)), 2)
-        self.assertEqual(pending_releases(self.zone)[0].to_dict()["generation"], 2)
+        entries = pending_releases(self.zone)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0].to_dict()["generation"], 2)
+        self.assertEqual([entry.seq for entry in entries], [1, 2])
+        self.assertIn("间距", entries[0].basis)
+
+    def test_clear_releases_per_crane_and_holds_the_rest(self) -> None:
+        occupy(self.zone, "crane-1")
+        occupy(self.zone, "crane-2")
+        occupy(self.zone, "crane-3")
+        register_conflict(self.zone, ("crane-1", "crane-2"))
+        lock_zone(self.zone)
+        notifier = RecordingNotifier()
+        positions = {
+            "crane-1": Point(0.0, 0.0),
+            "crane-2": Point(5.0, 0.0),
+            "crane-3": Point(50.0, 50.0),
+        }
+        outcome = clear_conflict(self.zone, notifier, positions=positions, safe=12.0)
+        # crane-3 间距核验通过，单独释放；crane-1/2 仍然过近，继续锁着
+        self.assertEqual(outcome.released, ("crane-3",))
+        self.assertEqual([held.crane_id for held in outcome.held], ["crane-1", "crane-2"])
+        self.assertTrue(is_latched(self.zone))
+        self.assertTrue(self.zone.is_conflict())
+        self.assertEqual(notifier.calls[0][1], ("crane-3",))
+        missing = {held.crane_id: held.missing for held in outcome.held}
+        self.assertTrue(any("crane-2" in reason for reason in missing["crane-1"]))
+        self.assertEqual(
+            [held.crane_id for held in held_snapshot(self.zone)], ["crane-1", "crane-2"]
+        )
+        # crane-2 退出占用后再次清除：逐车评估，满足条件的全部放行
+        vacate(self.zone, "crane-2")
+        second = clear_conflict(self.zone, notifier, positions=positions, safe=12.0)
+        self.assertEqual(second.released, ("crane-1", "crane-2", "crane-3"))
+        self.assertFalse(is_latched(self.zone))
+        self.assertFalse(self.zone.is_conflict())
+        entries = pending_releases(self.zone)
+        self.assertEqual([entry.seq for entry in entries], [1, 2, 3, 4])
+        self.assertEqual(entries[2].crane_id, "crane-2")
+        self.assertEqual(entries[2].basis, "占用已退出分区")
+        self.assertEqual(release_seq_now(self.zone), 4)
+        self.assertEqual(held_snapshot(self.zone), [])
+
+    def test_clear_holds_cranes_without_positions(self) -> None:
+        occupy(self.zone, "crane-1")
+        occupy(self.zone, "crane-2")
+        register_conflict(self.zone, ("crane-1", "crane-2"))
+        lock_zone(self.zone)
+        notifier = RecordingNotifier()
+        outcome = clear_conflict(
+            self.zone, notifier, positions={"crane-1": Point(0.0, 0.0)}, safe=12.0
+        )
+        self.assertEqual(outcome.released, ())
+        self.assertTrue(is_latched(self.zone))
+        self.assertEqual(notifier.calls, [])
+        self.assertEqual(pending_releases(self.zone), [])
+        missing = {held.crane_id: held.missing for held in outcome.held}
+        self.assertEqual(missing["crane-2"], ("缺少实时位置，无法核验间距",))
+        self.assertTrue(any("crane-2" in reason for reason in missing["crane-1"]))
+
+    def test_persist_and_restore_release_state(self) -> None:
+        store = MemoryStore()
+        occupy(self.zone, "crane-1")
+        occupy(self.zone, "crane-2")
+        register_conflict(self.zone, ("crane-1", "crane-2"))
+        lock_zone(self.zone)
+        clear_conflict(
+            self.zone,
+            positions={"crane-1": Point(0.0, 0.0), "crane-2": Point(5.0, 0.0)},
+            safe=12.0,
+        )
+        persist(self.zone, store)
+        reloaded = ZoneState("zone-1", "stale", [])
+        restore(reloaded, store)
+        self.assertTrue(is_latched(reloaded))
+        self.assertEqual(
+            [held.crane_id for held in held_snapshot(reloaded)], ["crane-1", "crane-2"]
+        )
+        vacate(self.zone, "crane-1")
+        clear_conflict(self.zone, positions={"crane-2": Point(5.0, 0.0)}, safe=12.0)
+        persist(self.zone, store)
+        reloaded = ZoneState("zone-1", "stale", [])
+        restore(reloaded, store)
+        entries = pending_releases(reloaded)
+        self.assertEqual([entry.seq for entry in entries], [1, 2])
+        self.assertEqual(entries[0].crane_id, "crane-1")
+        self.assertEqual(entries[0].basis, "占用已退出分区")
+        self.assertEqual(release_seq_now(reloaded), 2)
+        self.assertFalse(is_latched(reloaded))
 
     def test_clear_without_notifier(self) -> None:
-        self.assertEqual(clear_conflict(self.zone), 1)
+        outcome = clear_conflict(self.zone)
+        self.assertEqual(outcome.generation, 1)
+        self.assertEqual(outcome.released, ())
+        self.assertFalse(is_latched(self.zone))
 
     def test_coverage_and_area(self) -> None:
         positions = {"crane-1": Point(50.0, 50.0), "crane-2": Point(150.0, 50.0)}

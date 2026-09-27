@@ -44,6 +44,8 @@ def zone_view(console: "Console") -> dict[str, object]:
         "latest_registration_seq": zone_module.latest_registration_seq(zone),
         "latch_generation": zone_module.latch_generation(zone),
         "pending_releases": [entry.to_dict() for entry in zone_module.pending_releases(zone)],
+        "held_cranes": [held.to_dict() for held in zone_module.held_snapshot(zone)],
+        "release_seq": zone_module.release_seq_now(zone),
         "occupancy_version": zone_module.occupancy_version(zone),
     }
 

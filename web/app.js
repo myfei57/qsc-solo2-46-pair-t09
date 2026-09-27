@@ -57,7 +57,7 @@ async function refresh() {
   renderCards([
     ["塔吊数量", Object.keys(cluster.positions || {}).length],
     ["分区占用", (zone.occupants || []).length, zone.conflict ? "danger" : ""],
-    ["冲突闩锁", zone.latch ? "锁定" : "释放", zone.latch ? "danger" : ""],
+    ["冲突闩锁", zone.latch ? `锁定 ${(zone.held_cranes || []).length} 台` : "释放", zone.latch ? "danger" : ""],
     ["回转状态", slew.moving ? "运转" : "停止", wind.active ? "warn" : ""],
     ["落钩状态", hoist.hook_lowered ? "已落钩" : "未落钩", hoist.hook_lowered ? "" : "warn"],
     ["制动状态", hoist.brake_engaged ? "抱闸" : "松闸"],

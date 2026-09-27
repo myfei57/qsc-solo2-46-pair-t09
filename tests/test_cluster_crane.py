@@ -103,7 +103,12 @@ class ClusterTests(unittest.TestCase):
         occupy(zone, "crane-1")
         occupy(zone, "crane-2")
         register_conflict(zone, ("crane-1", "crane-2"))
-        clear_conflict(zone, self.cluster)
+        clear_conflict(
+            zone,
+            self.cluster,
+            positions=fleet.current_positions(self.cluster),
+            safe=12.0,
+        )
         self.assertTrue(fleet.is_released(self.cluster, "crane-1"))
         self.assertEqual(fleet.release_count(self.cluster, "crane-1"), 1)
         self.assertEqual(fleet.release_generation_now(self.cluster), 1)
