@@ -43,21 +43,61 @@ class DispatchFlowTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertFalse(payload["ok"])
 
-    def test_conflict_flow_blocks_then_releases_slew(self) -> None:
+    def test_conflict_flow_releases_cranes_individually(self) -> None:
         dispatch(self.console, "POST", "/api/cluster/survey", {"cranes": {"crane-2": {"x": 5, "y": 0}}})
         dispatch(self.console, "POST", "/api/zone/occupy", {"crane_id": "crane-1"})
         status, payload = dispatch(self.console, "POST", "/api/zone/occupy", {"crane_id": "crane-2"})
         self.assertEqual(status, 200)
         self.assertEqual(len(payload["data"]["conflicts"]), 1)
+        # The zone latch blocks every crane while the conflict is live.
         status, payload = dispatch(self.console, "POST", "/api/slew/start")
         self.assertEqual(status, 409)
         self.assertEqual(payload["error"], "zone latch held")
+        # Clearing while both cranes still occupy and are too close releases
+        # nobody; the response says exactly what each crane is missing.
         status, payload = dispatch(self.console, "POST", "/api/zone/clear")
         self.assertEqual(status, 200)
-        self.assertFalse(payload["data"]["latch"])
+        self.assertTrue(payload["data"]["latch"])
+        self.assertEqual(payload["data"]["decision"]["released"], [])
+        withheld = {entry["crane_id"]: entry for entry in payload["data"]["decision"]["withheld"]}
+        self.assertIn("still-occupying", withheld["crane-1"]["reasons"])
+        self.assertIn("too-close:crane-2", withheld["crane-1"]["reasons"])
+        self.assertEqual(withheld["crane-1"]["blockers"], ["crane-2"])
+        self.assertAlmostEqual(withheld["crane-1"]["min_distance"], 5.0)
         status, payload = dispatch(self.console, "POST", "/api/slew/start")
+        self.assertEqual(status, 409)
+        # Move the cranes apart. crane-1 then vacates first and is released on
+        # its own; crane-2 keeps the zone latch because it is still occupying.
+        dispatch(
+            self.console,
+            "POST",
+            "/api/cluster/survey",
+            {"cranes": {"crane-1": {"x": 0, "y": 0}, "crane-2": {"x": 80, "y": 0}}},
+        )
+        status, payload = dispatch(self.console, "POST", "/api/zone/vacate", {"crane_id": "crane-1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["decision"]["released"][0]["crane_id"], "crane-1")
+        self.assertEqual(payload["data"]["decision"]["released"][0]["basis"], [
+            "position-known", "occupancy-cleared", "safe-separation"
+        ])
+        self.assertTrue(payload["data"]["latch"])
+        self.assertEqual(payload["data"]["latched_cranes"], ["crane-2"])
+        # crane-1 can swing now while crane-2 is still held.
+        status, payload = dispatch(self.console, "POST", "/api/slew/start", {"crane_id": "crane-1"})
         self.assertEqual(status, 200)
         self.assertTrue(payload["data"]["moving"])
+        status, payload = dispatch(self.console, "POST", "/api/slew/start", {"crane_id": "crane-2"})
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"], "zone latch held")
+        # Once crane-2 also exits its occupancy, clear releases it and the
+        # ledger preserves the release order and basis.
+        status, payload = dispatch(self.console, "POST", "/api/zone/vacate", {"crane_id": "crane-2"})
+        self.assertEqual(payload["data"]["decision"]["released"][0]["crane_id"], "crane-2")
+        self.assertFalse(payload["data"]["latch"])
+        ledger = payload["data"]["release_ledger"]
+        self.assertEqual([entry["crane_id"] for entry in ledger], ["crane-1", "crane-2"])
+        self.assertEqual([entry["order"] for entry in ledger], [1, 2])
+        self.assertEqual([entry["generation"] for entry in ledger], [1, 2])
 
     def test_occupy_requires_crane_id(self) -> None:
         status, _ = dispatch(self.console, "POST", "/api/zone/occupy", {})

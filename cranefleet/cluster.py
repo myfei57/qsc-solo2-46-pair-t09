@@ -7,7 +7,7 @@ import math
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Mapping, Sequence
+from typing import Mapping
 
 from .errors import NoCranesSurveyed, StoreNotFound
 from .geometry import Line, Point, compute_separation
@@ -64,29 +64,22 @@ class Cluster:
         self.release_counts: dict[str, int] = {}
         self.release_ledger: list[ReleaseRecord] = []
 
-    def on_conflict_cleared(
-        self,
-        zone_id: str,
-        crane_ids: Sequence[str],
-        generation: int,
-        conflicts: Sequence[str],
-    ) -> None:
-        """Notifier callback invoked by the zone once a conflict clears."""
+    def on_latch_released(self, zone_id: str, crane_id: str, generation: int) -> None:
+        """Notifier callback invoked by the zone for each released crane."""
 
         with self._lock:
             if generation < self.release_generation:
                 return
             self.release_generation = generation
-            for crane_id in crane_ids:
-                self.released[crane_id] = True
-                self.release_counts[crane_id] = self.release_counts.get(crane_id, 0) + 1
-                self.release_ledger.append(
-                    ReleaseRecord(
-                        crane_id=crane_id,
-                        generation=generation,
-                        count=self.release_counts[crane_id],
-                    )
+            self.released[crane_id] = True
+            self.release_counts[crane_id] = self.release_counts.get(crane_id, 0) + 1
+            self.release_ledger.append(
+                ReleaseRecord(
+                    crane_id=crane_id,
+                    generation=generation,
+                    count=self.release_counts[crane_id],
                 )
+            )
 
 
 def survey(cluster: Cluster, points: Mapping[str, Point]) -> None:

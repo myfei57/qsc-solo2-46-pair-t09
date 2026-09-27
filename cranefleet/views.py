@@ -26,6 +26,7 @@ def zone_view(console: "Console") -> dict[str, object]:
     coverage = zone_module.coverage_check(zone, positions)
     occupied = {crane_id: zone.occupied_by(crane_id) for crane_id in zone_module.occupants_snapshot(zone)}
     separation = zone_module.separation(zone, fleet.baseline_positions(console.cluster))
+    safe = console.config.safe_separation
     return {
         "id": zone.id,
         "name": zone.name,
@@ -43,7 +44,12 @@ def zone_view(console: "Console") -> dict[str, object]:
         "separation": separation.to_dict(),
         "latest_registration_seq": zone_module.latest_registration_seq(zone),
         "latch_generation": zone_module.latch_generation(zone),
-        "pending_releases": [entry.to_dict() for entry in zone_module.pending_releases(zone)],
+        "latched_cranes": zone_module.latched_cranes(zone),
+        "latch_report": [
+            entry.to_dict()
+            for entry in zone_module.latch_report(zone, positions, safe)
+        ],
+        "release_ledger": [entry.to_dict() for entry in zone_module.release_ledger_of(zone)],
         "occupancy_version": zone_module.occupancy_version(zone),
     }
 

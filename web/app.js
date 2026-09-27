@@ -1,5 +1,49 @@
 const $ = (id) => document.getElementById(id);
 
+const LATCH_REASON_LABELS = {
+  "still-occupying": "本车占用尚未退出",
+  "missing-position": "缺少本车实测坐标",
+};
+
+function latchReasonLabel(reason) {
+  if (LATCH_REASON_LABELS[reason]) {
+    return LATCH_REASON_LABELS[reason];
+  }
+  let match = reason.match(/^too-close:(.+)$/);
+  if (match) {
+    return `与 ${match[1]} 距离不足`;
+  }
+  match = reason.match(/^peer-unlocated:(.+)$/);
+  if (match) {
+    return `${match[1]} 缺少实测坐标，无法验证间距`;
+  }
+  return reason;
+}
+
+function renderZoneLatchPanel(zone) {
+  const panel = $("zone-latch-panel");
+  const report = zone.latch_report || [];
+  if (!zone.latch || report.length === 0) {
+    panel.innerHTML = "";
+    return;
+  }
+  const rows = report.map((entry) => {
+    const reasons = (entry.reasons.length
+      ? entry.reasons.map(latchReasonLabel)
+      : ["等待下一轮解除"]
+    ).map((text) => `<li>${text}</li>`).join("");
+    const detail = entry.min_distance >= 0
+      ? `（实测 ${entry.min_distance.toFixed(1)} 米 / 要求 ${entry.safe_distance.toFixed(1)} 米）`
+      : "";
+    return `<div class="latch-row">
+      <span class="latch-crane">${entry.crane_id}</span>
+      <span class="latch-state">锁定中 ${detail}</span>
+      <ul class="latch-reasons">${reasons}</ul>
+    </div>`;
+  }).join("");
+  panel.innerHTML = `<h3>逐车闩锁（按闩入顺序）</h3>${rows}`;
+}
+
 async function api(path, options) {
   const response = await fetch(path, options);
   return response.json();
@@ -67,6 +111,7 @@ async function refresh() {
     ["审计记录", data.audit || 0],
   ]);
   $("crane-data").textContent = JSON.stringify(cluster, null, 2);
+  renderZoneLatchPanel(zone);
   $("zone-data").textContent = JSON.stringify(zone, null, 2);
   $("hoist-data").textContent = JSON.stringify(hoist, null, 2);
   $("alarm-data").textContent = JSON.stringify({ wind, limit }, null, 2);

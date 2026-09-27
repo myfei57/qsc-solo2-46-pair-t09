@@ -189,8 +189,10 @@ class Console:
         )
         if conflicts:
             zone_module.register_conflict(self.zone, conflicts[0].crane_ids)
-            zone_module.lock_zone(self.zone)
-            zone_module.persist(self.zone, self.store)
+            try:
+                zone_module.persist(self.zone, self.store)
+            except StoreError as exc:
+                LOGGER.debug("best-effort zone persist skipped after conflict: %s", exc)
             self.audit.record(crane_id, "zone-conflict", "pair detected")
         if mismatches:
             self.audit.record(crane_id, "occupancy-reconcile", "mismatch")
@@ -206,24 +208,60 @@ class Console:
         if not request.body_valid:
             return 400, fail("bad request")
         crane_id = str(request.body.get("crane_id") or "")
+        if not crane_id:
+            return 400, fail("crane_id required")
         zone_module.vacate(self.zone, crane_id)
         try:
             zone_module.persist(self.zone, self.store)
         except StoreError as exc:
             LOGGER.debug("best-effort zone persist skipped after vacate: %s", exc)
-        return 200, ok(zone_module.occupants_snapshot(self.zone))
+        # Leaving the zone is a release condition: evaluate immediately so a
+        # crane that backed out safely is not held behind one that did not.
+        decision = self._evaluate_zone_latches()
+        try:
+            zone_module.persist(self.zone, self.store)
+        except StoreError as exc:
+            LOGGER.debug("best-effort zone persist skipped after vacate evaluation: %s", exc)
+        return 200, ok({"decision": decision.to_dict(), **views.zone_view(self)})
+
+    def _evaluate_zone_latches(self) -> zone_module.ReleaseDecision:
+        """Evaluate every latched crane against its own release conditions."""
+
+        positions = fleet.current_positions(self.cluster)
+        decision = zone_module.evaluate_releases(
+            self.zone, positions, self.config.safe_separation, self.cluster
+        )
+        for entry in decision.released:
+            if entry.crane_id in self.cranes:
+                slew_module.release_latch_hold(self.slew)
+            self.audit.record(
+                entry.crane_id,
+                "latch-release",
+                f"order={entry.order} gen={entry.generation} min={entry.min_distance:.1f}m",
+            )
+        for entry in decision.withheld:
+            self.audit.record(
+                entry.crane_id,
+                "latch-withheld",
+                ",".join(entry.reasons)
+                + (f" min={entry.min_distance:.1f}m<{entry.safe_distance:.1f}m"
+                   if entry.blockers else ""),
+            )
+        return decision
 
     def handle_zone_clear(self, request: Request) -> tuple[int, dict[str, Any]]:
-        generation = zone_module.clear_conflict(self.zone, self.cluster)
-        for crane_id in self.cranes:
-            if fleet.is_released(self.cluster, crane_id):
-                slew_module.release_latch_hold(self.slew)
+        decision = self._evaluate_zone_latches()
         try:
             zone_module.persist(self.zone, self.store)
         except StoreError as exc:
             LOGGER.debug("best-effort zone persist skipped after clear: %s", exc)
-        self.audit.record("system", "zone-clear", f"{self.zone.id} generation={generation}")
-        return 200, ok(views.zone_view(self))
+        self.audit.record(
+            "system",
+            "zone-clear",
+            f"{self.zone.id} gen={decision.generation} released={len(decision.released)} "
+            f"held={len(decision.withheld)}",
+        )
+        return 200, ok({"decision": decision.to_dict(), **views.zone_view(self)})
 
     # ---------------------------------------------------------------- cluster
 
@@ -247,7 +285,8 @@ class Console:
     # ------------------------------------------------------------------- slew
 
     def handle_slew_start(self, request: Request) -> tuple[int, dict[str, Any]]:
-        if zone_module.is_latched(self.zone):
+        crane_id = str(request.body.get("crane_id") or "crane-1")
+        if zone_module.crane_latched(self.zone, crane_id):
             return 409, fail("zone latch held")
         try:
             slew_module.start(self.slew, self.zone, self.store, self.audit)

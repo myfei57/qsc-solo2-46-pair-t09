@@ -2,8 +2,13 @@
 
 Every zone owns the occupancy registrations reported by the cranes working
 inside it, the conflict flag raised when two cranes get too close, and the
-latch that keeps a swing blocked until the conflict is cleared. The zone is
-the component whose state must be durable before any swing is allowed, so the
+per-crane latches that keep each swing blocked until that crane is safe to
+release. A latch is never released fleet-wide: when the conflict clears the
+zone evaluates every latched crane on its own merits (occupancy exited,
+fresh surveyed position, safe separation from every peer) and releases only
+the cranes that pass, keeping the rest locked with an explicit reason. The
+release ledger records the order and basis of every release. The zone is the
+component whose state must be durable before any swing is allowed, so the
 persistence helpers live here rather than in the console.
 """
 
@@ -11,23 +16,110 @@ from __future__ import annotations
 
 import json
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Protocol, Sequence
 
 from .geometry import Point, Polygon
 from .errors import StoreNotFound
 from .store import Store
 
+# Release basis recorded for every released crane.
+BASIS_POSITION_KNOWN = "position-known"
+BASIS_OCCUPANCY_CLEARED = "occupancy-cleared"
+BASIS_SAFE_SEPARATION = "safe-separation"
+RELEASE_BASIS = (
+    BASIS_POSITION_KNOWN,
+    BASIS_OCCUPANCY_CLEARED,
+    BASIS_SAFE_SEPARATION,
+)
+
+# Withhold reasons explaining why a crane stays latched.
+REASON_MISSING_POSITION = "missing-position"
+REASON_STILL_OCCUPYING = "still-occupying"
+REASON_PEER_UNLOCATED = "peer-unlocated"
+
+
+def reason_too_close(crane_id: str) -> str:
+    """Withhold reason: the crane is closer than the safe distance to a peer."""
+
+    return f"too-close:{crane_id}"
+
+
+def reason_peer_unlocated(crane_id: str) -> str:
+    """Withhold reason: a peer has no fresh position so safety cannot be proven."""
+
+    return f"{REASON_PEER_UNLOCATED}:{crane_id}"
+
 
 @dataclass(frozen=True)
 class ReleaseEntry:
-    """One crane that was released from the latch at a given generation."""
+    """One crane that was released from the latch.
 
+    ``order`` is the zone-wide 1-based release sequence and ``latch_seq`` the
+    order in which the crane was latched, so the ledger shows the queue
+    discipline. ``basis`` lists the checks that passed and ``min_distance`` is
+    the closest clearance measured at release time.
+    """
+
+    order: int
     crane_id: str
     generation: int
+    basis: tuple[str, ...] = field(default=())
+    min_distance: float = -1.0
+    latch_seq: int = 0
 
     def to_dict(self) -> dict[str, object]:
-        return {"crane_id": self.crane_id, "generation": self.generation}
+        return {
+            "order": self.order,
+            "crane_id": self.crane_id,
+            "generation": self.generation,
+            "basis": list(self.basis),
+            "min_distance": self.min_distance,
+            "latch_seq": self.latch_seq,
+        }
+
+
+@dataclass(frozen=True)
+class WithheldEntry:
+    """A latched crane that failed evaluation, with every missing condition."""
+
+    crane_id: str
+    reasons: tuple[str, ...]
+    blockers: tuple[str, ...]
+    min_distance: float
+    safe_distance: float
+    occupying: bool
+    position_known: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "crane_id": self.crane_id,
+            "reasons": list(self.reasons),
+            "blockers": list(self.blockers),
+            "min_distance": self.min_distance,
+            "safe_distance": self.safe_distance,
+            "occupying": self.occupying,
+            "position_known": self.position_known,
+        }
+
+
+@dataclass(frozen=True)
+class ReleaseDecision:
+    """Outcome of one release evaluation pass."""
+
+    generation: int
+    released: tuple[ReleaseEntry, ...]
+    withheld: tuple[WithheldEntry, ...]
+
+    def released_ids(self) -> list[str]:
+        return [entry.crane_id for entry in self.released]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "generation": self.generation,
+            "released": [entry.to_dict() for entry in self.released],
+            "withheld": [entry.to_dict() for entry in self.withheld],
+        }
 
 
 @dataclass(frozen=True)
@@ -87,16 +179,10 @@ class DistanceReport:
         }
 
 
-class ConflictNotifier(Protocol):
-    """Receives the release notification once a zone conflict clears."""
+class LatchReleaseNotifier(Protocol):
+    """Receives one callback per crane released from a zone latch."""
 
-    def on_conflict_cleared(
-        self,
-        zone_id: str,
-        crane_ids: Sequence[str],
-        generation: int,
-        conflicts: Sequence[str],
-    ) -> None:
+    def on_latch_released(self, zone_id: str, crane_id: str, generation: int) -> None:
         ...
 
 
@@ -115,7 +201,10 @@ class ZoneState:
         self.conflict = False
         self.latch = False
         self.latch_generation = 0
-        self.conflict_pairs: list[str] = []
+        # crane_id -> sequence in which it was latched (queue discipline)
+        self.latched: dict[str, int] = {}
+        self.latch_seq = 0
+        self.release_seq = 0
         self.cached_positions: dict[str, Point] = {}
         self.registration_seq = 0
         self.registration_seq_by_crane: dict[str, int] = {}
@@ -166,7 +255,11 @@ def occupy(zone: ZoneState, crane_id: str) -> int:
 
 
 def vacate(zone: ZoneState, crane_id: str) -> None:
-    """Remove a crane from the zone once it leaves."""
+    """Remove a crane from the zone once it leaves.
+
+    The crane is only dropped from the occupancy registrations; a latched
+    crane keeps its latch until ``evaluate_releases`` proves it is safe.
+    """
 
     with zone._lock:  # noqa: SLF001
         if zone.occupants.pop(crane_id, None) is not None:
@@ -194,8 +287,22 @@ def latest_registration_seq(zone: ZoneState) -> int:
 
 
 def is_latched(zone: ZoneState) -> bool:
+    """True while at least one crane is still held by the zone latch."""
+
     with zone._lock:  # noqa: SLF001
-        return zone.latch
+        return bool(zone.latched)
+
+
+def crane_latched(zone: ZoneState, crane_id: str) -> bool:
+    with zone._lock:  # noqa: SLF001
+        return crane_id in zone.latched
+
+
+def latched_cranes(zone: ZoneState) -> list[str]:
+    """Latched cranes in latch order (first latched first)."""
+
+    with zone._lock:  # noqa: SLF001
+        return [crane_id for crane_id, _ in sorted(zone.latched.items(), key=_latch_key)]
 
 
 def latch_generation(zone: ZoneState) -> int:
@@ -203,7 +310,7 @@ def latch_generation(zone: ZoneState) -> int:
         return zone.latch_generation
 
 
-def pending_releases(zone: ZoneState) -> list[ReleaseEntry]:
+def release_ledger_of(zone: ZoneState) -> list[ReleaseEntry]:
     with zone._lock:  # noqa: SLF001
         return list(zone.release_ledger)
 
@@ -230,6 +337,11 @@ def persist(zone: ZoneState, store: Store) -> None:
             "registrations": list(zone.registrations),
             "conflict": zone.conflict,
             "latch": zone.latch,
+            "latched": dict(zone.latched),
+            "latch_seq": zone.latch_seq,
+            "release_seq": zone.release_seq,
+            "latch_generation": zone.latch_generation,
+            "release_ledger": [entry.to_dict() for entry in zone.release_ledger],
         }
         payload = json.dumps(snapshot, ensure_ascii=False).encode("utf-8")
         store.save(_zone_key(zone.id), payload)
@@ -253,7 +365,31 @@ def restore(zone: ZoneState, store: Store) -> None:
         zone.occupants = {crane_id: True for crane_id in snapshot["occupants"]}
         zone.registrations = list(snapshot["registrations"])
         zone.conflict = snapshot["conflict"]
-        zone.latch = snapshot["latch"]
+        zone.latch_seq = snapshot.get("latch_seq", 0)
+        zone.release_seq = snapshot.get("release_seq", 0)
+        zone.latch_generation = snapshot.get("latch_generation", 0)
+        zone.release_ledger = [
+            ReleaseEntry(
+                order=item["order"],
+                crane_id=item["crane_id"],
+                generation=item["generation"],
+                basis=tuple(item.get("basis", ())),
+                min_distance=item.get("min_distance", -1.0),
+                latch_seq=item.get("latch_seq", 0),
+            )
+            for item in snapshot.get("release_ledger", [])
+        ]
+        latched = snapshot.get("latched")
+        if latched is None:
+            # Backwards compatibility with snapshots written before per-crane
+            # latches: a held latch applied to every occupant.
+            latched = {}
+            if snapshot["latch"]:
+                for crane_id in sorted(zone.occupants):
+                    zone.latch_seq += 1
+                    latched[crane_id] = zone.latch_seq
+        zone.latched = dict(latched)
+        zone.latch = bool(zone.latched)
         zone.durable = True
 
 
@@ -275,45 +411,189 @@ def detect_conflicts(zone: ZoneState, positions: Mapping[str, Point], safe: floa
 
 
 def register_conflict(zone: ZoneState, crane_ids: Sequence[str]) -> None:
-    """Raise the conflict flag, latch the zone and record the pair."""
+    """Raise the conflict flag and latch each crane involved.
+
+    Cranes already latched keep their original latch sequence so the release
+    queue order is stable across repeated conflict reports.
+    """
 
     with zone._lock:  # noqa: SLF001
         zone.conflict = True
         zone.latch = True
         for crane_id in crane_ids:
-            if crane_id:
-                zone.occupants[crane_id] = True
-                zone.conflict_pairs.append(crane_id)
+            if not crane_id:
+                continue
+            zone.occupants.setdefault(crane_id, True)
+            if crane_id not in zone.latched:
+                zone.latch_seq += 1
+                zone.latched[crane_id] = zone.latch_seq
 
 
-def lock_zone(zone: ZoneState) -> None:
-    """Advance the latch generation and hold the zone."""
-
-    with zone._lock:  # noqa: SLF001
-        zone.latch = True
-        zone.latch_generation += 1
+def _latch_key(item: tuple[str, int]) -> tuple[int, str]:
+    crane_id, sequence = item
+    return sequence, crane_id
 
 
-def clear_conflict(zone: ZoneState, notifier: ConflictNotifier | None = None) -> int:
-    """Clear the conflict and release the latch, notifying the fleet.
+def _assess_crane(
+    crane_id: str,
+    occupants: frozenset[str],
+    latched_peers: frozenset[str],
+    positions: Mapping[str, Point],
+    safe: float,
+) -> tuple[list[str], list[str], float, bool, bool]:
+    """Evaluate one crane against the release conditions.
 
-    Returns the generation the release was published under so callers can
-    correlate the notification with the release ledger.
+    Returns the missing-condition reasons, the blocking peers, the closest
+    measured clearance (``-1`` when unknown) and the occupancy/position flags.
+    The peer set is fixed by the caller so two cranes vacating together can
+    never release each other in the same pass.
+    """
+
+    reasons: list[str] = []
+    point = positions.get(crane_id)
+    position_known = point is not None
+    occupying = crane_id in occupants
+    if not position_known:
+        reasons.append(REASON_MISSING_POSITION)
+    if occupying:
+        reasons.append(REASON_STILL_OCCUPYING)
+    blockers: list[str] = []
+    min_distance = -1.0
+    peers = sorted((occupants | latched_peers) - {crane_id})
+    for peer in peers:
+        peer_point = positions.get(peer)
+        if peer_point is None:
+            reasons.append(reason_peer_unlocated(peer))
+            continue
+        if point is None:
+            continue
+        distance = point.distance(peer_point)
+        if min_distance < 0.0 or distance < min_distance:
+            min_distance = distance
+        if distance < safe:
+            blockers.append(peer)
+            reasons.append(reason_too_close(peer))
+    return reasons, blockers, min_distance, occupying, position_known
+
+
+def _withheld_from_assessment(
+    crane_id: str,
+    reasons: Sequence[str],
+    blockers: Sequence[str],
+    min_distance: float,
+    safe: float,
+    occupying: bool,
+    position_known: bool,
+) -> WithheldEntry:
+    return WithheldEntry(
+        crane_id=crane_id,
+        reasons=tuple(dict.fromkeys(reasons)),
+        blockers=tuple(blockers),
+        min_distance=min_distance,
+        safe_distance=safe,
+        occupying=occupying,
+        position_known=position_known,
+    )
+
+
+def evaluate_releases(
+    zone: ZoneState,
+    positions: Mapping[str, Point],
+    safe: float,
+    notifier: LatchReleaseNotifier | None = None,
+) -> ReleaseDecision:
+    """Release every latched crane that currently meets all conditions.
+
+    Each latched crane is evaluated on its own. A crane is released only when
+    it has a fresh position, its own occupancy registration has exited, and it
+    keeps at least ``safe`` metres from every crane still occupying the zone
+    or still latched. Eligible cranes are released in latch order; the others
+    stay locked and are returned with the conditions they are missing. The
+    generation advances once per pass that releases at least one crane.
     """
 
     with zone._lock:  # noqa: SLF001
-        zone.conflict = False
-        zone.latch = False
-        zone.latch_generation += 1
+        candidates = [crane_id for crane_id, _ in sorted(zone.latched.items(), key=_latch_key)]
+        occupants = frozenset(zone.occupants)
+        latched_peers = frozenset(zone.latched)
+        released: list[ReleaseEntry] = []
+        withheld: list[WithheldEntry] = []
         generation = zone.latch_generation
-        crane_ids = list(zone.occupants)
-        conflicts = list(zone.conflict_pairs)
-        zone.conflict_pairs = []
-        for crane_id in crane_ids:
-            zone.release_ledger.append(ReleaseEntry(crane_id=crane_id, generation=generation))
+        for crane_id in candidates:
+            reasons, blockers, min_distance, occupying, position_known = _assess_crane(
+                crane_id, occupants, latched_peers, positions, safe
+            )
+            if reasons:
+                withheld.append(
+                    _withheld_from_assessment(
+                        crane_id, reasons, blockers, min_distance, safe, occupying, position_known
+                    )
+                )
+                continue
+            if not released:
+                zone.latch_generation += 1
+                generation = zone.latch_generation
+            zone.release_seq += 1
+            latch_seq = zone.latched.pop(crane_id)
+            entry = ReleaseEntry(
+                order=zone.release_seq,
+                crane_id=crane_id,
+                generation=generation,
+                basis=RELEASE_BASIS,
+                min_distance=min_distance,
+                latch_seq=latch_seq,
+            )
+            zone.release_ledger.append(entry)
+            released.append(entry)
+        zone.conflict = bool(_occupant_conflicts(occupants, positions, safe))
+        zone.latch = bool(zone.latched)
+        decision = ReleaseDecision(
+            generation=generation, released=tuple(released), withheld=tuple(withheld)
+        )
     if notifier is not None:
-        notifier.on_conflict_cleared(zone.id, crane_ids, generation, conflicts)
-    return generation
+        for entry in released:
+            notifier.on_latch_released(zone.id, entry.crane_id, entry.generation)
+    return decision
+
+
+def _occupant_conflicts(
+    occupants: frozenset[str], positions: Mapping[str, Point], safe: float
+) -> list[tuple[str, str]]:
+    cranes = sorted(occupants)
+    pairs: list[tuple[str, str]] = []
+    for index, first in enumerate(cranes):
+        for second in cranes[index + 1 :]:
+            point_a = positions.get(first)
+            point_b = positions.get(second)
+            if point_a is None or point_b is None:
+                continue
+            if point_a.distance(point_b) < safe:
+                pairs.append((first, second))
+    return pairs
+
+
+def latch_report(zone: ZoneState, positions: Mapping[str, Point], safe: float) -> list[WithheldEntry]:
+    """Explain why every currently latched crane is still held.
+
+    The report is a live evaluation, so a crane that has since become safe is
+    returned with empty reasons: it is waiting for the next release pass.
+    """
+
+    with zone._lock:  # noqa: SLF001
+        candidates = [crane_id for crane_id, _ in sorted(zone.latched.items(), key=_latch_key)]
+        occupants = frozenset(zone.occupants)
+        latched_peers = frozenset(zone.latched)
+    entries: list[WithheldEntry] = []
+    for crane_id in candidates:
+        reasons, blockers, min_distance, occupying, position_known = _assess_crane(
+            crane_id, occupants, latched_peers, positions, safe
+        )
+        entries.append(
+            _withheld_from_assessment(
+                crane_id, reasons, blockers, min_distance, safe, occupying, position_known
+            )
+        )
+    return entries
 
 
 def coverage_check(zone: ZoneState, positions: Mapping[str, Point]) -> Coverage:

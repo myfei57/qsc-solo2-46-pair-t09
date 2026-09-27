@@ -30,7 +30,7 @@ from cranefleet.hoist import Hoist, lower as hoist_lower
 from cranefleet.slew import Slew, start as slew_start
 from cranefleet.store import MemoryStore
 from cranefleet.trolley import Trolley
-from cranefleet.zone import ZoneState, clear_conflict, occupy, register_conflict
+from cranefleet.zone import ZoneState, evaluate_releases, occupy, register_conflict, vacate
 
 BOUNDARY = [Point(0.0, 0.0), Point(100.0, 0.0), Point(100.0, 100.0), Point(0.0, 100.0)]
 
@@ -98,18 +98,35 @@ class ClusterTests(unittest.TestCase):
         _, mismatches = fleet.check_conflicts(self.cluster, zone, 100.0)
         self.assertIn("crane-9", mismatches)
 
-    def test_conflict_clear_notifies_cluster(self) -> None:
+    def test_conflict_clear_notifies_cluster_per_crane(self) -> None:
         zone = ZoneState("zone-1", "zone", BOUNDARY)
         occupy(zone, "crane-1")
         occupy(zone, "crane-2")
         register_conflict(zone, ("crane-1", "crane-2"))
-        clear_conflict(zone, self.cluster)
+        # crane-1 has exited its occupancy and the pair is safely apart;
+        # crane-2 is still in the zone and stays latched.
+        vacate(zone, "crane-1")
+        positions = {
+            "crane-1": self.cluster.cranes["crane-1"],
+            "crane-2": self.cluster.cranes["crane-2"],
+        }
+        decision = evaluate_releases(zone, positions, 12.0, self.cluster)
+        self.assertEqual(decision.released_ids(), ["crane-1"])
         self.assertTrue(fleet.is_released(self.cluster, "crane-1"))
+        self.assertFalse(fleet.is_released(self.cluster, "crane-2"))
         self.assertEqual(fleet.release_count(self.cluster, "crane-1"), 1)
         self.assertEqual(fleet.release_generation_now(self.cluster), 1)
+        self.assertEqual(len(fleet.release_ledger_now(self.cluster)), 1)
+        record = fleet.release_ledger_now(self.cluster)[0]
+        self.assertEqual(record.to_dict()["count"], 1)
+        self.assertEqual(record.crane_id, "crane-1")
+        # Releasing the second crane later publishes a later generation.
+        vacate(zone, "crane-2")
+        decision = evaluate_releases(zone, positions, 12.0, self.cluster)
+        self.assertEqual(decision.released_ids(), ["crane-2"])
+        self.assertEqual(fleet.release_generation_now(self.cluster), 2)
+        self.assertEqual(fleet.release_count(self.cluster, "crane-2"), 1)
         self.assertEqual(len(fleet.release_ledger_now(self.cluster)), 2)
-        self.assertEqual(fleet.released_snapshot(self.cluster)["crane-2"], True)
-        self.assertEqual(fleet.release_ledger_now(self.cluster)[0].to_dict()["count"], 1)
 
 
 class CraneTests(unittest.TestCase):
